@@ -75,7 +75,9 @@ const LittlefieldAnalysis = () => {
         setLoading(true);
         setError('');
 
-        const response = await fetch('/data/Consolidate Data-Daily Data.xlsx');
+        const response = await fetch(
+          `${import.meta.env.BASE_URL}data/Consolidate Data-Daily Data.xlsx`
+        );
         if (!response.ok) {
           throw new Error('Could not load Excel file. Make sure the file exists in the /data folder.');
         }
