@@ -1,4 +1,4 @@
-import { Config, ParsedData } from './types';
+import type { Config } from './types';
 
 // Random number generator for simulation (seeded for consistency)
 export const randomExponential = (lambda: number, seed: number) => {
@@ -28,10 +28,8 @@ export const calculateProfitProjection = (
   currentDay: number,
   currentCash: number,
   currentDebt: number,
-  parsedData: ParsedData[],
   currentSettings: Config
 ) => {
-  const recentData = parsedData.slice(-14);
   const daysRemaining = 318 - currentDay;
 
   // M/M/c Queuing parameters

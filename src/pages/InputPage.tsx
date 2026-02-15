@@ -1,6 +1,6 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Config } from '../types';
+import type { Config } from '../types';
 
 interface InputPageProps {
   loading: boolean;

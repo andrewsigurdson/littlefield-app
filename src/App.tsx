@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import * as XLSX from 'xlsx';
@@ -55,9 +55,10 @@ const LittlefieldAnalysis = () => {
   const navigate = useNavigate();
 
   const [csvData, setCsvData] = useState('');
+  const [dataFileName, setDataFileName] = useState('');
   const [cashOnHand, setCashOnHand] = useState('');
   const [debt, setDebt] = useState('');
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [currentSettings, setCurrentSettings] = useState({
     lotSize: 20,
@@ -68,49 +69,33 @@ const LittlefieldAnalysis = () => {
     station2Priority: 'FIFO'
   });
 
-  // Load Excel file on mount
-  useEffect(() => {
-    const loadExcelFile = async () => {
-      try {
-        setLoading(true);
-        setError('');
+  const handleFileUpload = async (file: File) => {
+    try {
+      setLoading(true);
+      setError('');
+      setDataFileName(file.name);
 
-        const response = await fetch(
-          `${import.meta.env.BASE_URL}data/Consolidate Data-Daily Data.xlsx`
-        );
-        if (!response.ok) {
-          throw new Error('Could not load Excel file. Make sure the file exists in the /data folder.');
-        }
+      const arrayBuffer = await file.arrayBuffer();
+      const workbook = XLSX.read(arrayBuffer, { type: 'array' });
 
-        const arrayBuffer = await response.arrayBuffer();
-        const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+      // Get the first sheet
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
 
-        // Get the first sheet
-        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      // Convert to tab-separated values (TSV)
+      const tsvData = XLSX.utils.sheet_to_csv(firstSheet, { FS: '\t' });
 
-        // Convert to tab-separated values (TSV)
-        const tsvData = XLSX.utils.sheet_to_csv(firstSheet, { FS: '\t' });
-
-        setCsvData(tsvData);
-        setLoading(false);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Error loading Excel file');
-        setLoading(false);
-      }
-    };
-
-    loadExcelFile();
-  }, []);
+      setCsvData(tsvData);
+      setLoading(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error loading Excel file');
+      setLoading(false);
+    }
+  };
 
   // Test scenario state
-  const [testSettings, setTestSettings] = useState({
-    lotSize: 20,
-    contract: 1,
-    station1Machines: 3,
-    station2Machines: 1,
-    station3Machines: 1,
-    station2Priority: 'FIFO'
-  });
+  const [testSettings, setTestSettings] = useState(() => ({
+    ...currentSettings
+  }));
 
   // Parse CSV data
   const parsedData = useMemo(() => {
@@ -160,7 +145,6 @@ const LittlefieldAnalysis = () => {
 
   // Calculate profit projection with lead time penalties, material costs, and M/M/c queuing
   const calculateProfitProjection = (config: Config, currentDay: number, currentCash: number, currentDebt: number) => {
-    const recentData = parsedData.slice(-14);
     const daysRemaining = 318 - currentDay;
 
     // M/M/c Queuing parameters
@@ -707,20 +691,38 @@ const LittlefieldAnalysis = () => {
     recommendations.analysis.cash,
     recommendations.analysis.debt
   ) : null;
+  const header = (
+    <h1 className="text-3xl font-bold mb-6 text-blue-900">
+      Littlefield Live Optimizer {location.pathname === '/testing' && '- Testing'}
+    </h1>
+  );
 
-  const isTesting = location.pathname === '/testing';
-  const isReady = Boolean(recommendations && recommendedProjection && testProjection);
+  if (location.pathname !== '/testing') {
+    return (
+      <div className="w-full max-w-7xl mx-auto p-6 bg-gray-50">
+        {header}
 
-  return (
-    <div className="w-full max-w-7xl mx-auto p-6 bg-gray-50">
-      <h1 className="text-3xl font-bold mb-6 text-blue-900">
-        Littlefield Live Optimizer {location.pathname === '/testing' && '- Testing'}
-      </h1>
-
-      {!isTesting ? (
         <div className="space-y-6">
           <div className="bg-white p-6 rounded-lg shadow-md">
             <h2 className="text-xl font-bold mb-4 text-gray-800">Step 1: Historical Data Status</h2>
+
+            <div className="mb-4">
+              <label className="block text-sm font-medium mb-2">Upload Historical Data (.xlsx)</label>
+              <input
+                type="file"
+                accept=".xlsx"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) {
+                    void handleFileUpload(file);
+                  }
+                }}
+                className="w-full p-2 border-2 border-gray-300 rounded bg-white"
+              />
+              <p className="text-xs text-gray-500 mt-2">
+                Upload the latest Littlefield export. No repo update required.
+              </p>
+            </div>
 
             {loading ? (
               <div className="flex items-center justify-center py-8">
@@ -730,19 +732,23 @@ const LittlefieldAnalysis = () => {
               <div className="bg-red-50 border-2 border-red-300 rounded p-4">
                 <p className="text-red-800 font-bold mb-2">Error loading data:</p>
                 <p className="text-red-600 text-sm">{error}</p>
-                <p className="text-gray-600 text-xs mt-3">
-                  Make sure "Consolidate Data-Daily Data.xlsx" exists in the /data folder
-                </p>
               </div>
             ) : (
               <div className="bg-green-50 border-2 border-green-300 rounded p-4">
                 <p className="text-green-800 font-bold mb-2">✓ Data loaded successfully!</p>
                 <p className="text-gray-600 text-sm">
-                  Loaded {parsedData.length} days of data from "Consolidate Data-Daily Data.xlsx"
+                  Loaded {parsedData.length} days of data from "{dataFileName || 'uploaded file'}"
                 </p>
                 <p className="text-gray-500 text-xs mt-2">
-                  To update data, replace the Excel file in the /data folder and refresh the page
+                  To update data, upload a new Excel file here.
                 </p>
+              </div>
+            )}
+
+            {!loading && !error && !csvData && (
+              <div className="bg-yellow-50 border-2 border-yellow-300 rounded p-4 mt-4">
+                <p className="text-yellow-800 font-bold mb-1">No data loaded yet</p>
+                <p className="text-yellow-700 text-sm">Please upload a .xlsx file to continue.</p>
               </div>
             )}
           </div>
@@ -903,19 +909,33 @@ const LittlefieldAnalysis = () => {
             🚀 RUN OPTIMIZATION ALGORITHM
           </button>
         </div>
-      ) : !isReady ? (
+      </div>
+    );
+  }
+
+  if (!recommendations || !recommendedProjection || !testProjection) {
+    return (
+      <div className="w-full max-w-7xl mx-auto p-6 bg-gray-50">
+        {header}
         <div className="bg-white p-6 rounded-lg shadow-md">
           <h2 className="text-xl font-bold mb-4 text-gray-800">Loading Recommendations</h2>
           <p className="text-gray-600 text-sm">
             Waiting for historical data and analysis to finish loading.
           </p>
         </div>
-      ) : (
-        <div className="space-y-6">
-          <div className="bg-gradient-to-r from-blue-600 to-blue-800 text-white p-6 rounded-lg shadow-lg">
-            <h2 className="text-2xl font-bold mb-2">Test Configuration</h2>
-            <p className="text-blue-100">Analysis based on last 14 days (Days {recommendations.analysis.currentDay - 13} - {recommendations.analysis.currentDay})</p>
-          </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full max-w-7xl mx-auto p-6 bg-gray-50">
+      {header}
+
+      <div className="space-y-6">
+        <div className="bg-gradient-to-r from-blue-600 to-blue-800 text-white p-6 rounded-lg shadow-lg">
+          <h2 className="text-2xl font-bold mb-2">Test Configuration</h2>
+          <p className="text-blue-100">Analysis based on last 14 days (Days {recommendations.analysis.currentDay - 13} - {recommendations.analysis.currentDay})</p>
+        </div>
 
           {/* Current Setup Statistics */}
           <div className="bg-white p-6 rounded-lg shadow-md">
@@ -1827,9 +1847,8 @@ const LittlefieldAnalysis = () => {
             ← Back to Input
           </button>
         </div>
-      )}
-    </div>
-  );
+      </div>
+    );
 };
 
 export default LittlefieldAnalysis;
