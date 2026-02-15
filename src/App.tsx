@@ -142,14 +142,6 @@ const LittlefieldAnalysis = () => {
     }).filter(d => d.day > 0);
   }, [csvData]);
 
-  // Random number generator for simulation (seeded for consistency)
-  const randomExponential = (lambda: number, seed: number) => {
-    // Simple pseudo-random using sine (deterministic for same seed)
-    const x = Math.sin(seed) * 10000;
-    const random = x - Math.floor(x);
-    return -Math.log(1 - random) / lambda;
-  };
-
   const randomPoisson = (lambda: number, seed: number) => {
     // Generate Poisson random variable using inverse transform
     const L = Math.exp(-lambda);
@@ -169,7 +161,6 @@ const LittlefieldAnalysis = () => {
   // Calculate profit projection with lead time penalties, material costs, and M/M/c queuing
   const calculateProfitProjection = (config: Config, currentDay: number, currentCash: number, currentDebt: number) => {
     const recentData = parsedData.slice(-14);
-    const historicalAvgJobsPerDay = recentData.reduce((sum, d) => sum + d.jobsOut, 0) / recentData.length;
     const daysRemaining = 318 - currentDay;
 
     // M/M/c Queuing parameters
@@ -717,13 +708,16 @@ const LittlefieldAnalysis = () => {
     recommendations.analysis.debt
   ) : null;
 
+  const isTesting = location.pathname === '/testing';
+  const isReady = Boolean(recommendations && recommendedProjection && testProjection);
+
   return (
     <div className="w-full max-w-7xl mx-auto p-6 bg-gray-50">
       <h1 className="text-3xl font-bold mb-6 text-blue-900">
         Littlefield Live Optimizer {location.pathname === '/testing' && '- Testing'}
       </h1>
 
-      {location.pathname !== '/testing' ? (
+      {!isTesting ? (
         <div className="space-y-6">
           <div className="bg-white p-6 rounded-lg shadow-md">
             <h2 className="text-xl font-bold mb-4 text-gray-800">Step 1: Historical Data Status</h2>
@@ -908,6 +902,13 @@ const LittlefieldAnalysis = () => {
           >
             🚀 RUN OPTIMIZATION ALGORITHM
           </button>
+        </div>
+      ) : !isReady ? (
+        <div className="bg-white p-6 rounded-lg shadow-md">
+          <h2 className="text-xl font-bold mb-4 text-gray-800">Loading Recommendations</h2>
+          <p className="text-gray-600 text-sm">
+            Waiting for historical data and analysis to finish loading.
+          </p>
         </div>
       ) : (
         <div className="space-y-6">
