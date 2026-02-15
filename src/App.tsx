@@ -2,52 +2,17 @@ import React, { useState, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import * as XLSX from 'xlsx';
-
-interface Change {
-  type: string;
-  action: string;
-  reason: string;
-  cost: number;
-  needsDebt?: boolean;
-  priority: string;
-}
-
-interface Bottleneck {
-  station: number;
-  priority: number;
-  util: number;
-  queue: number;
-  cost: number;
-}
-
-interface Analysis {
-  avgUtil1: number;
-  avgUtil2: number;
-  avgUtil3: number;
-  avgQueue1: number;
-  avgQueue2: number;
-  avgQueue3: number;
-  avgLeadTime: number;
-  maxLeadTime: number;
-  avgQueuedJobs: number;
-  netCash: number;
-  currentDay: number;
-  cash: number;
-  debt: number;
-}
-
-interface Config {
-  lotSize: number;
-  contract: number;
-  station1Machines: number;
-  station2Machines: number;
-  station3Machines: number;
-  station2Priority: string;
-}
+import type { Change, Bottleneck, Analysis, Config } from './types';
 
 // Number formatting utility
 const formatNumber = (num: number, decimals: number = 0): string => {
   return num.toFixed(decimals).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+};
+
+type InventoryState = {
+  inventory: number;
+  orderInTransit: boolean;
+  orderArrivalDay: number;
 };
 
 const LittlefieldAnalysis = () => {
@@ -66,7 +31,9 @@ const LittlefieldAnalysis = () => {
     station1Machines: 3,
     station2Machines: 1,
     station3Machines: 1,
-    station2Priority: 'FIFO'
+    station2Priority: 'FIFO',
+    materialReorderPoint: 1320,
+    materialOrderQty: 7200
   });
 
   const handleFileUpload = async (file: File) => {
@@ -127,24 +94,23 @@ const LittlefieldAnalysis = () => {
     }).filter(d => d.day > 0);
   }, [csvData]);
 
-  const randomPoisson = (lambda: number, seed: number) => {
-    // Generate Poisson random variable using inverse transform
-    const L = Math.exp(-lambda);
-    let k = 0;
-    let p = 1;
-
-    do {
-      k++;
-      const x = Math.sin(seed + k) * 10000;
-      const u = x - Math.floor(x);
-      p *= u;
-    } while (p > L);
-
-    return k - 1;
-  };
+  React.useEffect(() => {
+    if (parsedData.length > 0) {
+      const last = parsedData[parsedData.length - 1];
+      setCashOnHand(String(last.cashBalance));
+    } else {
+      setCashOnHand('');
+    }
+  }, [parsedData]);
 
   // Calculate profit projection with lead time penalties, material costs, and M/M/c queuing
-  const calculateProfitProjection = (config: Config, currentDay: number, currentCash: number, currentDebt: number) => {
+  const calculateProfitProjection = (
+    config: Config,
+    currentDay: number,
+    currentCash: number,
+    currentDebt: number,
+    inventoryState: InventoryState
+  ) => {
     const daysRemaining = 318 - currentDay;
 
     // M/M/c Queuing parameters
@@ -174,18 +140,6 @@ const LittlefieldAnalysis = () => {
     };
 
     const avgJobsPerDay = calculateDailyThroughput();
-
-    // Material costs
-    const kitsPerJob = 60;
-    const costPerKit = 0.010; // $10 per kit = $0.010k
-    const fixedOrderCost = 1.0; // $1,000 per order = $1k
-    const orderQuantity = 7.2; // 7,200 kits = 7.2k kits
-
-    // Calculate total material costs over remaining days
-    const totalKitsNeeded = avgJobsPerDay * kitsPerJob * daysRemaining;
-    const numberOfOrders = Math.ceil(totalKitsNeeded / (orderQuantity * 1000)); // Convert 7.2k to 7200
-    const totalMaterialCost = (totalKitsNeeded * costPerKit) + (numberOfOrders * fixedOrderCost);
-    const dailyMaterialCost = totalMaterialCost / daysRemaining;
 
     // Simulate lead times with Station 2 priority policy
     // Station 2 processes jobs twice: Step 2 (after S1) and Step 4 (after S3)
@@ -312,6 +266,68 @@ const LittlefieldAnalysis = () => {
       upfrontFee = debtNeeded * 0.05;
       newDebt = currentDebt + debtNeeded + upfrontFee;
     }
+
+    // Material costs (order-based)
+    const kitsPerJob = 60;
+    const costPerKit = 0.010; // $10 per kit = $0.010k
+    const fixedOrderCost = 1.0; // $1,000 per order = $1k
+    const orderQuantity = Math.max(0, config.materialOrderQty);
+    const reorderPoint = Math.max(0, config.materialReorderPoint);
+    const materialLeadTimeDays = 3;
+    const orderCost = (orderQuantity * costPerKit) + fixedOrderCost;
+
+    let totalMaterialCost = 0;
+    let kitsInventory = inventoryState.inventory;
+    let orderInTransit = inventoryState.orderInTransit;
+    let orderArrivalDay = inventoryState.orderArrivalDay;
+    let queuedJobs = 0; // Jobs waiting for kits in projection
+    let runningCashForMaterials = currentCash - totalMachineCost - upfrontFee;
+
+    const revenuePerJob = expectedRevenuePerJob;
+    const dailyInterestRateForCash = Math.pow(1.20, 1/365) - 1;
+
+    for (let i = 0; i < daysRemaining; i++) {
+      const day = currentDay + i + 1;
+
+      if (orderInTransit && day >= orderArrivalDay) {
+        kitsInventory += orderQuantity;
+        orderInTransit = false;
+      }
+
+      // Process kit consumption with queue tracking (similar to historical)
+      // 1. Release queued jobs first
+      const jobsFromQueue = Math.min(queuedJobs, Math.floor(kitsInventory / kitsPerJob));
+      kitsInventory -= jobsFromQueue * kitsPerJob;
+      queuedJobs -= jobsFromQueue;
+
+      // 2. Try to start new jobs (avgJobsPerDay demand)
+      const maxNewJobs = Math.floor(kitsInventory / kitsPerJob);
+      const newJobsStarted = Math.min(avgJobsPerDay, maxNewJobs);
+      kitsInventory -= newJobsStarted * kitsPerJob;
+
+      // 3. Jobs that can't start go to queue
+      const jobsAddedToQueue = avgJobsPerDay - newJobsStarted;
+      queuedJobs += jobsAddedToQueue;
+
+      // Total jobs completed (for revenue calculation)
+      const jobsCompleted = jobsFromQueue + newJobsStarted;
+
+      const dailyRev = jobsCompleted * revenuePerJob;
+      const dailyInterest = currentDebt > 0 ? currentDebt * dailyInterestRateForCash : 0;
+      runningCashForMaterials += (dailyRev - dailyInterest);
+
+      if (kitsInventory <= reorderPoint &&
+          !orderInTransit &&
+          runningCashForMaterials >= orderCost &&
+          orderQuantity > 0) {
+        totalMaterialCost += orderCost;
+        runningCashForMaterials -= orderCost;
+        orderInTransit = true;
+        orderArrivalDay = day + materialLeadTimeDays;
+      }
+    }
+
+    const dailyMaterialCost = daysRemaining > 0 ? totalMaterialCost / daysRemaining : 0;
     
     // Daily interest rate (20% annual compounded daily)
     const dailyInterestRate = Math.pow(1.20, 1/365) - 1;
@@ -422,6 +438,8 @@ const LittlefieldAnalysis = () => {
       station2Machines: currentSettings.station2Machines,
       station3Machines: currentSettings.station3Machines,
       station2Priority: currentSettings.station2Priority,
+      materialReorderPoint: currentSettings.materialReorderPoint,
+      materialOrderQty: currentSettings.materialOrderQty,
       changes: [],
       analysis: {} as Analysis
     };
@@ -607,17 +625,19 @@ const LittlefieldAnalysis = () => {
 
   // Initialize test settings when recommendations are ready
   React.useEffect(() => {
-    if (recommendations && location.pathname === '/testing') {
+    if (location.pathname === '/testing') {
       setTestSettings({
-        lotSize: recommendations.lotSize,
-        contract: recommendations.contract,
-        station1Machines: recommendations.station1Machines,
-        station2Machines: recommendations.station2Machines,
-        station3Machines: recommendations.station3Machines,
-        station2Priority: recommendations.station2Priority
+        lotSize: currentSettings.lotSize,
+        contract: currentSettings.contract,
+        station1Machines: currentSettings.station1Machines,
+        station2Machines: currentSettings.station2Machines,
+        station3Machines: currentSettings.station3Machines,
+        station2Priority: currentSettings.station2Priority,
+        materialReorderPoint: currentSettings.materialReorderPoint,
+        materialOrderQty: currentSettings.materialOrderQty
       });
     }
-  }, [recommendations, location.pathname]);
+  }, [currentSettings, location.pathname]);
 
   const handleRun = () => {
     if (loading) {
@@ -628,16 +648,18 @@ const LittlefieldAnalysis = () => {
       alert('Please make sure the Excel file is loaded successfully');
       return;
     }
-    if (!cashOnHand) {
-      alert('Please enter cash on hand');
-      return;
-    }
     navigate('/testing');
   };
 
   const handleReset = () => {
     navigate('/');
   };
+
+  React.useEffect(() => {
+    if (location.pathname === '/testing' && parsedData.length === 0) {
+      navigate('/');
+    }
+  }, [location.pathname, parsedData.length, navigate]);
 
   // Chart data
   const utilizationData = parsedData.slice(-30).map(d => ({
@@ -678,19 +700,438 @@ const LittlefieldAnalysis = () => {
   };
 
   // Calculate projections for recommended and test configs
-  const recommendedProjection = recommendations ? calculateProfitProjection(
-    recommendations,
+  const historicalMaterialSimulation = useMemo(() => {
+    if (parsedData.length === 0) {
+      return {
+        financialSeries: [],
+        inventorySeries: [],
+        inventoryState: { inventory: 7200, orderInTransit: false, orderArrivalDay: 0 }
+      };
+    }
+
+    const kitsPerJob = 60;
+    const costPerKit = 0.010; // $10 per kit = $0.010k
+    const fixedOrderCost = 1.0; // $1,000 per order
+    const materialLeadTimeDays = 3;
+
+    let kitsInventory = 7200;
+    let orderInTransit = false;
+    let orderArrivalDay = 0;
+    let queuedJobs = 0; // Jobs waiting for kits
+
+    const financialSeries: Array<{
+      day: number;
+      cash: number;
+      revenue: number;
+      materialCost: number;
+      machineCost: number;
+      interest: number;
+    }> = [];
+    const inventorySeries: Array<{
+      day: number;
+      inventory: number;
+      reorderPoint: number;
+      orderPlaced: number;
+    }> = [];
+    const dailyCashInterestRate = Math.pow(1.10, 1 / 365) - 1;
+    let runningCash = 0;
+
+    for (const d of parsedData) {
+      const useDefaultMaterials = d.day < 50;
+      const orderQuantity = useDefaultMaterials ? 7200 : Math.max(0, currentSettings.materialOrderQty);
+      const reorderPoint = useDefaultMaterials ? 1200 : Math.max(0, currentSettings.materialReorderPoint);
+      const orderCost = (orderQuantity * costPerKit) + fixedOrderCost;
+
+      // Calculate revenue and cash FIRST (before receiving orders or consuming)
+      const contractRevenue = useDefaultMaterials ? 750 : (
+        currentSettings.contract === 1 ? 750 :
+        currentSettings.contract === 2 ? 1000 : 1250
+      );
+      const revenueFromJobs = (d.jobsOut * contractRevenue) / 1000; // $k
+      const interestEarned = runningCash * dailyCashInterestRate;
+      const cashAfterInterest = runningCash + interestEarned;
+      const cashAfterRevenue = cashAfterInterest + revenueFromJobs;
+
+      // Check if order arrives today
+      if (orderInTransit && d.day >= orderArrivalDay) {
+        kitsInventory += orderQuantity;
+        orderInTransit = false;
+      }
+
+      // Process kit consumption with queue tracking
+      // 1. First, try to release queued jobs (jobs waiting for kits from previous days)
+      const jobsFromQueue = Math.min(queuedJobs, Math.floor(kitsInventory / kitsPerJob));
+      const kitsForQueuedJobs = jobsFromQueue * kitsPerJob;
+      kitsInventory -= kitsForQueuedJobs;
+      queuedJobs -= jobsFromQueue;
+
+      // 2. Then process newly accepted jobs today
+      const newJobsAccepted = d.jobsAccepted;
+      const maxNewJobsFromInventory = Math.floor(kitsInventory / kitsPerJob);
+      const newJobsStarted = Math.min(newJobsAccepted, maxNewJobsFromInventory);
+      const kitsForNewJobs = newJobsStarted * kitsPerJob;
+      kitsInventory -= kitsForNewJobs;
+
+      // 3. Jobs that couldn't start due to insufficient kits go into the queue
+      const jobsAddedToQueue = newJobsAccepted - newJobsStarted;
+      queuedJobs += jobsAddedToQueue;
+
+      // Check if we need to order (AFTER consuming, with updated cash available)
+      let materialCost = 0;
+      let orderPlaced = 0;
+      const canAfford = cashAfterRevenue >= orderCost;
+
+      // Order if: current inventory <= ROP AND no existing order in transit AND can afford
+      // Key insight: We check CURRENT inventory after consumption, not projected
+      if (kitsInventory <= reorderPoint &&
+          !orderInTransit &&
+          canAfford &&
+          orderQuantity > 0) {
+        materialCost = orderCost;
+        orderPlaced = 1;
+        orderInTransit = true;
+        orderArrivalDay = d.day + materialLeadTimeDays;
+      }
+
+      runningCash = cashAfterRevenue - materialCost;
+
+      financialSeries.push({
+        day: d.day,
+        cash: parseFloat(runningCash.toFixed(2)),
+        revenue: parseFloat(revenueFromJobs.toFixed(2)),
+        materialCost: parseFloat(materialCost.toFixed(2)),
+        machineCost: 0,
+        interest: parseFloat(interestEarned.toFixed(3))
+      });
+
+      inventorySeries.push({
+        day: d.day,
+        inventory: parseFloat(kitsInventory.toFixed(0)),
+        reorderPoint,
+        orderPlaced
+      });
+    }
+
+    return {
+      financialSeries,
+      inventorySeries,
+      inventoryState: { inventory: kitsInventory, orderInTransit, orderArrivalDay }
+    };
+  }, [parsedData, currentSettings.materialOrderQty, currentSettings.materialReorderPoint, currentSettings.contract]);
+
+  const historicalFinancialData = historicalMaterialSimulation.financialSeries;
+  const historicalInventoryData = historicalMaterialSimulation.inventorySeries;
+  const inventoryState = historicalMaterialSimulation.inventoryState;
+
+  const currentProjection = recommendations ? calculateProfitProjection(
+    currentSettings,
     recommendations.analysis.currentDay,
     recommendations.analysis.cash,
-    recommendations.analysis.debt
+    recommendations.analysis.debt,
+    inventoryState
   ) : null;
 
   const testProjection = recommendations ? calculateProfitProjection(
     testSettings,
     recommendations.analysis.currentDay,
     recommendations.analysis.cash,
-    recommendations.analysis.debt
+    recommendations.analysis.debt,
+    inventoryState
   ) : null;
+
+  const currentProjectionData = useMemo(() => {
+    if (!recommendations || !currentProjection) return [];
+    const currentDay = recommendations.analysis.currentDay;
+    const daysRemaining = 318 - currentDay;
+    const dailyDebtInterestRate = Math.pow(1.20, 1 / 365) - 1; // 20% annual on debt
+    const dailyCashInterestRate = Math.pow(1.10, 1 / 365) - 1; // 10% annual on cash
+    let runningDebt = recommendations.analysis.debt;
+    let runningCash = recommendations.analysis.cash;
+
+    const revenuePerJob = currentProjection.expectedRevenuePerJob / 1000; // Convert to $k
+    if (currentProjection.avgJobsPerDay <= 0) return [];
+    const projectionData = [];
+
+    const kitsPerJob = 60;
+    const costPerKit = 0.010; // $10 per kit = $0.010k
+    const fixedOrderCost = 1.0; // $1,000 per order
+    const orderQuantity = Math.max(0, currentSettings.materialOrderQty);
+    const reorderPoint = Math.max(0, currentSettings.materialReorderPoint);
+    const materialLeadTimeDays = 3;
+    const orderCost = (orderQuantity * costPerKit) + fixedOrderCost;
+
+    let kitsInventory = inventoryState.inventory;
+    let orderInTransit = inventoryState.orderInTransit;
+    let orderArrivalDay = inventoryState.orderArrivalDay;
+    let queuedJobs = 0; // Jobs waiting for kits
+
+    for (let i = 0; i < daysRemaining; i++) {
+      const day = currentDay + i + 1;
+
+      // Order arrives first
+      if (orderInTransit && day >= orderArrivalDay) {
+        kitsInventory += orderQuantity;
+        orderInTransit = false;
+      }
+
+      // Queue-aware kit consumption
+      const jobsFromQueue = Math.min(queuedJobs, Math.floor(kitsInventory / kitsPerJob));
+      kitsInventory -= jobsFromQueue * kitsPerJob;
+      queuedJobs -= jobsFromQueue;
+
+      const maxNewJobs = Math.floor(kitsInventory / kitsPerJob);
+      const newJobsStarted = Math.min(currentProjection.avgJobsPerDay, maxNewJobs);
+      kitsInventory -= newJobsStarted * kitsPerJob;
+
+      const jobsAddedToQueue = currentProjection.avgJobsPerDay - newJobsStarted;
+      queuedJobs += jobsAddedToQueue;
+
+      const jobsCompleted = jobsFromQueue + newJobsStarted;
+      const dailyRev = jobsCompleted * revenuePerJob;
+
+      // Calculate cash interest earned (10% annual on positive balance)
+      const cashInterestEarned = runningCash > 0 ? runningCash * dailyCashInterestRate : 0;
+
+      // Calculate debt interest paid (20% annual on debt)
+      const debtInterestPaid = runningDebt > 0 ? runningDebt * dailyDebtInterestRate : 0;
+
+      // Net interest = interest earned - interest paid
+      const netInterest = cashInterestEarned - debtInterestPaid;
+
+      let materialCost = 0;
+      if (kitsInventory <= reorderPoint &&
+          !orderInTransit &&
+          runningCash >= orderCost &&
+          orderQuantity > 0) {
+        materialCost = orderCost;
+        orderInTransit = true;
+        orderArrivalDay = day + materialLeadTimeDays;
+      }
+
+      const netProfit = dailyRev + netInterest - materialCost;
+
+      runningCash += netProfit;
+      let debtPayment = 0;
+      if (runningDebt > 0 && runningCash > 10) {
+        debtPayment = Math.min(runningDebt, runningCash - 10);
+        runningCash -= debtPayment;
+        runningDebt -= debtPayment;
+      }
+
+      projectionData.push({
+        day,
+        revenue: parseFloat(dailyRev.toFixed(2)),
+        materialCost: parseFloat(materialCost.toFixed(2)),
+        machineCost: 0,
+        interest: parseFloat(netInterest.toFixed(3)),
+        profit: parseFloat(netProfit.toFixed(2)),
+        debt: parseFloat(runningDebt.toFixed(2)),
+        cash: parseFloat(runningCash.toFixed(2))
+      });
+    }
+
+    return projectionData;
+  }, [
+    recommendations,
+    currentProjection,
+    currentSettings.materialOrderQty,
+    currentSettings.materialReorderPoint,
+    inventoryState.inventory,
+    inventoryState.orderInTransit,
+    inventoryState.orderArrivalDay
+  ]);
+
+  const testProjectionData = useMemo(() => {
+    if (!recommendations || !testProjection) return [];
+    const currentDay = recommendations.analysis.currentDay;
+    const daysRemaining = 318 - currentDay;
+    const dailyDebtInterestRate = Math.pow(1.20, 1 / 365) - 1; // 20% annual on debt
+    const dailyCashInterestRate = Math.pow(1.10, 1 / 365) - 1; // 10% annual on cash
+    let runningDebt = testProjection.newDebt;
+    let runningCash = (recommendations.analysis.cash || 0) - testProjection.totalMachineCost;
+
+    const revenuePerJob = testProjection.expectedRevenuePerJob / 1000; // Convert to $k
+    if (testProjection.avgJobsPerDay <= 0) return [];
+    const projectionData = [];
+
+    const kitsPerJob = 60;
+    const costPerKit = 0.010; // $10 per kit = $0.010k
+    const fixedOrderCost = 1.0; // $1,000 per order
+    const orderQuantity = Math.max(0, testSettings.materialOrderQty);
+    const reorderPoint = Math.max(0, testSettings.materialReorderPoint);
+    const materialLeadTimeDays = 3;
+    const orderCost = (orderQuantity * costPerKit) + fixedOrderCost;
+
+    let kitsInventory = inventoryState.inventory;
+    let orderInTransit = inventoryState.orderInTransit;
+    let orderArrivalDay = inventoryState.orderArrivalDay;
+    let queuedJobs = 0; // Jobs waiting for kits
+
+    for (let i = 0; i < daysRemaining; i++) {
+      const day = currentDay + i + 1;
+
+      if (orderInTransit && day >= orderArrivalDay) {
+        kitsInventory += orderQuantity;
+        orderInTransit = false;
+      }
+
+      // Queue-aware kit consumption
+      const jobsFromQueue = Math.min(queuedJobs, Math.floor(kitsInventory / kitsPerJob));
+      kitsInventory -= jobsFromQueue * kitsPerJob;
+      queuedJobs -= jobsFromQueue;
+
+      const maxNewJobs = Math.floor(kitsInventory / kitsPerJob);
+      const newJobsStarted = Math.min(testProjection.avgJobsPerDay, maxNewJobs);
+      kitsInventory -= newJobsStarted * kitsPerJob;
+
+      const jobsAddedToQueue = testProjection.avgJobsPerDay - newJobsStarted;
+      queuedJobs += jobsAddedToQueue;
+
+      const jobsCompleted = jobsFromQueue + newJobsStarted;
+
+      const dailyRev = jobsCompleted * revenuePerJob;
+
+      // Calculate cash interest earned (10% annual on positive balance)
+      const cashInterestEarned = runningCash > 0 ? runningCash * dailyCashInterestRate : 0;
+
+      // Calculate debt interest paid (20% annual on debt)
+      const debtInterestPaid = runningDebt > 0 ? runningDebt * dailyDebtInterestRate : 0;
+
+      // Net interest = interest earned - interest paid
+      const netInterest = cashInterestEarned - debtInterestPaid;
+
+      let materialCost = 0;
+      if (kitsInventory <= reorderPoint &&
+          !orderInTransit &&
+          runningCash >= orderCost &&
+          orderQuantity > 0) {
+        materialCost = orderCost;
+        orderInTransit = true;
+        orderArrivalDay = day + materialLeadTimeDays;
+      }
+
+      const netProfit = dailyRev + netInterest - materialCost;
+
+      runningCash += netProfit;
+      let debtPayment = 0;
+      if (runningDebt > 0 && runningCash > 10) {
+        debtPayment = Math.min(runningDebt, runningCash - 10);
+        runningCash -= debtPayment;
+        runningDebt -= debtPayment;
+      }
+
+      projectionData.push({
+        day,
+        revenue: parseFloat(dailyRev.toFixed(2)),
+        materialCost: parseFloat(materialCost.toFixed(2)),
+        machineCost: i === 0 ? parseFloat(testProjection.totalMachineCost.toFixed(2)) : 0,
+        interest: parseFloat(netInterest.toFixed(3)),
+        profit: parseFloat(netProfit.toFixed(2)),
+        debt: parseFloat(runningDebt.toFixed(2)),
+        cash: parseFloat(runningCash.toFixed(2)),
+        debtPayment: parseFloat(debtPayment.toFixed(2))
+      });
+    }
+
+    return projectionData;
+  }, [
+    recommendations,
+    testProjection,
+    testSettings.materialOrderQty,
+    testSettings.materialReorderPoint,
+    inventoryState.inventory,
+    inventoryState.orderInTransit,
+    inventoryState.orderArrivalDay
+  ]);
+
+  const testInventoryData = useMemo(() => {
+    if (!recommendations || !testProjection) return [];
+    const currentDay = recommendations.analysis.currentDay;
+    const daysRemaining = 318 - currentDay;
+
+    const kitsPerJob = 60;
+    const costPerKit = 0.010; // $10 per kit = $0.010k
+    const fixedOrderCost = 1.0; // $1,000 per order
+    const orderQuantity = Math.max(0, testSettings.materialOrderQty);
+    const reorderPoint = Math.max(0, testSettings.materialReorderPoint);
+    const leadTime = 4;
+    const orderCost = (orderQuantity * costPerKit) + fixedOrderCost;
+
+    const avgJobs = testProjection.avgJobsPerDay;
+    const revenuePerJob = testProjection.expectedRevenuePerJob;
+    const dailyInterestRate = Math.pow(1.20, 1 / 365) - 1;
+
+    let kitsInventory = inventoryState.inventory;
+    let orderInTransit = inventoryState.orderInTransit;
+    let orderArrivalDay = inventoryState.orderArrivalDay;
+    let queuedJobs = 0; // Jobs waiting for kits
+    let runningCash = (recommendations.analysis.cash || 0) - testProjection.totalMachineCost;
+    let runningDebt = testProjection.newDebt;
+
+    const data = [];
+
+    for (let i = 0; i < daysRemaining; i++) {
+      const day = currentDay + i + 1;
+
+      if (orderInTransit && day >= orderArrivalDay) {
+        kitsInventory += orderQuantity;
+        orderInTransit = false;
+      }
+
+      // Queue-aware kit consumption
+      const jobsFromQueue = Math.min(queuedJobs, Math.floor(kitsInventory / kitsPerJob));
+      kitsInventory -= jobsFromQueue * kitsPerJob;
+      queuedJobs -= jobsFromQueue;
+
+      const maxNewJobs = Math.floor(kitsInventory / kitsPerJob);
+      const newJobsStarted = Math.min(avgJobs, maxNewJobs);
+      kitsInventory -= newJobsStarted * kitsPerJob;
+
+      const jobsAddedToQueue = avgJobs - newJobsStarted;
+      queuedJobs += jobsAddedToQueue;
+
+      const jobsCompleted = jobsFromQueue + newJobsStarted;
+
+      let orderPlaced = 0;
+      if (kitsInventory <= reorderPoint &&
+          !orderInTransit &&
+          runningCash >= orderCost &&
+          orderQuantity > 0) {
+        orderPlaced = 1;
+        runningCash -= orderCost;
+        orderInTransit = true;
+        orderArrivalDay = day + leadTime;
+      }
+
+      const dailyRev = jobsCompleted * revenuePerJob;
+      const dailyInterest = runningDebt > 0 ? runningDebt * dailyInterestRate : 0;
+      const netProfit = dailyRev - dailyInterest;
+
+      runningCash += netProfit;
+      if (runningDebt > 0 && runningCash > 10) {
+        const debtPayment = Math.min(runningDebt, runningCash - 10);
+        runningCash -= debtPayment;
+        runningDebt -= debtPayment;
+      }
+
+      data.push({
+        day,
+        inventory: parseFloat(kitsInventory.toFixed(0)),
+        reorderPoint,
+        orderPlaced
+      });
+    }
+
+    return data;
+  }, [
+    recommendations,
+    testProjection,
+    testSettings.materialOrderQty,
+    testSettings.materialReorderPoint,
+    inventoryState.inventory,
+    inventoryState.orderInTransit,
+    inventoryState.orderArrivalDay
+  ]);
   const header = (
     <h1 className="text-3xl font-bold mb-6 text-blue-900">
       Littlefield Live Optimizer {location.pathname === '/testing' && '- Testing'}
@@ -733,6 +1174,11 @@ const LittlefieldAnalysis = () => {
                 <p className="text-red-800 font-bold mb-2">Error loading data:</p>
                 <p className="text-red-600 text-sm">{error}</p>
               </div>
+            ) : !csvData ? (
+              <div className="bg-yellow-50 border-2 border-yellow-300 rounded p-4 mt-4">
+                <p className="text-yellow-800 font-bold mb-1">No data loaded yet</p>
+                <p className="text-yellow-700 text-sm">Please upload a .xlsx file to continue.</p>
+              </div>
             ) : (
               <div className="bg-green-50 border-2 border-green-300 rounded p-4">
                 <p className="text-green-800 font-bold mb-2">✓ Data loaded successfully!</p>
@@ -742,13 +1188,6 @@ const LittlefieldAnalysis = () => {
                 <p className="text-gray-500 text-xs mt-2">
                   To update data, upload a new Excel file here.
                 </p>
-              </div>
-            )}
-
-            {!loading && !error && !csvData && (
-              <div className="bg-yellow-50 border-2 border-yellow-300 rounded p-4 mt-4">
-                <p className="text-yellow-800 font-bold mb-1">No data loaded yet</p>
-                <p className="text-yellow-700 text-sm">Please upload a .xlsx file to continue.</p>
               </div>
             )}
           </div>
@@ -829,6 +1268,28 @@ const LittlefieldAnalysis = () => {
                     <option value="Step 4">Prioritize Step 4</option>
                   </select>
                 </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">Material Reorder Point (kits)</label>
+                  <input
+                    type="number"
+                    value={currentSettings.materialReorderPoint}
+                    onChange={(e) => setCurrentSettings({...currentSettings, materialReorderPoint: parseInt(e.target.value) || 0})}
+                    className="w-full p-2 border-2 border-gray-300 rounded"
+                    min="0"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">Material Order Quantity (kits)</label>
+                  <input
+                    type="number"
+                    value={currentSettings.materialOrderQty}
+                    onChange={(e) => setCurrentSettings({...currentSettings, materialOrderQty: parseInt(e.target.value) || 0})}
+                    className="w-full p-2 border-2 border-gray-300 rounded"
+                    min="0"
+                  />
+                </div>
               </div>
             </div>
 
@@ -836,17 +1297,11 @@ const LittlefieldAnalysis = () => {
               <h2 className="text-xl font-bold mb-4 text-gray-800">Step 3: Financial Status</h2>
               
               <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium mb-1">Cash on Hand ($1000s)</label>
-                  <input
-                    type="number"
-                    value={cashOnHand}
-                    onChange={(e) => setCashOnHand(e.target.value)}
-                    className="w-full p-2 border-2 border-blue-300 rounded"
-                    placeholder="e.g., 52.916"
-                    step="0.001"
-                  />
-                  <p className="text-xs text-gray-500 mt-1">Enter value in thousands</p>
+                <div className="p-3 bg-blue-50 rounded">
+                  <p className="text-sm font-medium">Cash on Hand (from latest data)</p>
+                  <p className="text-2xl font-bold text-blue-600">
+                    ${formatNumber((parseFloat(cashOnHand) || 0), 2)}k
+                  </p>
                 </div>
 
                 <div>
@@ -862,14 +1317,12 @@ const LittlefieldAnalysis = () => {
                   <p className="text-xs text-gray-500 mt-1">Leave as 0 if no debt</p>
                 </div>
 
-                {cashOnHand && (
-                  <div className="mt-4 p-3 bg-blue-50 rounded">
-                    <p className="text-sm font-medium">Net Cash Available:</p>
-                    <p className="text-2xl font-bold text-blue-600">
-                      ${formatNumber(((parseFloat(cashOnHand) || 0) - (parseFloat(debt) || 0)), 2)}k
-                    </p>
-                  </div>
-                )}
+                <div className="mt-4 p-3 bg-blue-50 rounded">
+                  <p className="text-sm font-medium">Net Cash Available:</p>
+                  <p className="text-2xl font-bold text-blue-600">
+                    ${formatNumber(((parseFloat(cashOnHand) || 0) - (parseFloat(debt) || 0)), 2)}k
+                  </p>
+                </div>
               </div>
             </div>
 
@@ -913,7 +1366,7 @@ const LittlefieldAnalysis = () => {
     );
   }
 
-  if (!recommendations || !recommendedProjection || !testProjection) {
+  if (!recommendations || !currentProjection || !testProjection) {
     return (
       <div className="w-full max-w-7xl mx-auto p-6 bg-gray-50">
         {header}
@@ -929,6 +1382,14 @@ const LittlefieldAnalysis = () => {
 
   return (
     <div className="w-full max-w-7xl mx-auto p-6 bg-gray-50">
+      <div className="flex items-center justify-between mb-2">
+        <button
+          onClick={handleReset}
+          className="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-lg text-sm transition"
+        >
+          ← Back to Input
+        </button>
+      </div>
       {header}
 
       <div className="space-y-6">
@@ -958,6 +1419,80 @@ const LittlefieldAnalysis = () => {
               <p className="text-2xl font-bold text-green-600">${formatNumber(recommendations.analysis.cash, 0)}k / ${formatNumber(recommendations.analysis.debt, 0)}k</p>
             </div>
             </div>
+          </div>
+
+          <div className="bg-white p-6 rounded-lg shadow-md">
+            <h3 className="text-xl font-bold mb-4 text-gray-800">
+              Historical Cash At Hand (Day 1 → {parsedData[parsedData.length - 1]?.day ?? 'N/A'})
+            </h3>
+            <ResponsiveContainer width="100%" height={320}>
+              <LineChart data={historicalFinancialData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="day" />
+                <YAxis label={{ value: 'Amount ($k)', angle: -90, position: 'insideLeft' }} />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="cash" stroke="#10b981" strokeWidth={3} name="Cash On Hand" />
+                <Line type="monotone" dataKey="revenue" stroke="#3b82f6" strokeWidth={2} name="Daily Revenue" />
+                <Line type="monotone" dataKey="materialCost" stroke="#ef4444" strokeWidth={2} name="Material Cost" />
+                <Line type="monotone" dataKey="machineCost" stroke="#f59e0b" strokeWidth={2} name="Machine Payments" />
+                <Line type="monotone" dataKey="interest" stroke="#8b5cf6" strokeWidth={2} name="Cash Interest" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="bg-white p-6 rounded-lg shadow-md">
+            <h3 className="text-xl font-bold mb-4 text-gray-800">
+              Historical Inventory (Day 1 → {parsedData[parsedData.length - 1]?.day ?? 'N/A'})
+            </h3>
+            <ResponsiveContainer width="100%" height={320}>
+              <LineChart data={historicalInventoryData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="day" />
+                <YAxis label={{ value: 'Kits', angle: -90, position: 'insideLeft' }} />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="inventory" stroke="#10b981" strokeWidth={3} name="Inventory" />
+                <Line type="monotone" dataKey="reorderPoint" stroke="#f59e0b" strokeWidth={2} strokeDasharray="5 5" name="Reorder Point" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="bg-white p-6 rounded-lg shadow-md">
+            <h3 className="text-xl font-bold mb-4 text-gray-800">
+              Expected Cash Under Current Settings (Day {recommendations.analysis.currentDay + 1} → 318)
+            </h3>
+            <ResponsiveContainer width="100%" height={320}>
+              <LineChart data={currentProjectionData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="day" />
+                <YAxis label={{ value: 'Amount ($k)', angle: -90, position: 'insideLeft' }} />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="cash" stroke="#10b981" strokeWidth={3} name="Cash On Hand" />
+                <Line type="monotone" dataKey="revenue" stroke="#3b82f6" strokeWidth={2} name="Daily Revenue" />
+                <Line type="monotone" dataKey="materialCost" stroke="#ef4444" strokeWidth={2} name="Material Cost" />
+                <Line type="monotone" dataKey="machineCost" stroke="#f59e0b" strokeWidth={2} name="Machine Payments" />
+                <Line type="monotone" dataKey="interest" stroke="#8b5cf6" strokeWidth={2} name="Interest" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="bg-white p-6 rounded-lg shadow-md">
+            <h3 className="text-xl font-bold mb-4 text-gray-800">
+              Projected Inventory Under Test Settings (Day {recommendations.analysis.currentDay + 1} → 318)
+            </h3>
+            <ResponsiveContainer width="100%" height={320}>
+              <LineChart data={testInventoryData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="day" />
+                <YAxis label={{ value: 'Kits', angle: -90, position: 'insideLeft' }} />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="inventory" stroke="#10b981" strokeWidth={3} name="Inventory" />
+                <Line type="monotone" dataKey="reorderPoint" stroke="#f59e0b" strokeWidth={2} strokeDasharray="5 5" name="Reorder Point" />
+              </LineChart>
+            </ResponsiveContainer>
           </div>
 
           <div className="bg-white p-6 rounded-lg shadow-md">
@@ -1033,6 +1568,28 @@ const LittlefieldAnalysis = () => {
               </div>
 
               <div>
+                <label className="block text-sm font-medium mb-1">Material Reorder Point (kits)</label>
+                <input
+                  type="number"
+                  value={testSettings.materialReorderPoint}
+                  onChange={(e) => setTestSettings({...testSettings, materialReorderPoint: parseInt(e.target.value) || 0})}
+                  className="w-full p-2 border-2 border-purple-300 rounded"
+                  min="0"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-1">Material Order Quantity (kits)</label>
+                <input
+                  type="number"
+                  value={testSettings.materialOrderQty}
+                  onChange={(e) => setTestSettings({...testSettings, materialOrderQty: parseInt(e.target.value) || 0})}
+                  className="w-full p-2 border-2 border-purple-300 rounded"
+                  min="0"
+                />
+              </div>
+
+              <div>
                 <label className="block text-sm font-medium mb-1">Station 1 Machines</label>
                 <input
                   type="number"
@@ -1069,7 +1626,7 @@ const LittlefieldAnalysis = () => {
               </div>
             </div>
 
-            {testProjection && recommendedProjection && (
+            {testProjection && currentProjection && (
               <>
                 <div className="bg-white p-4 rounded-lg border-2 border-purple-400">
                   <h4 className="font-bold text-lg mb-3 text-purple-800">Test Results:</h4>
@@ -1180,164 +1737,50 @@ const LittlefieldAnalysis = () => {
 
                   <div className="mt-3 pt-3 border-t border-purple-200 text-center">
                     <p className="text-sm font-bold text-gray-700">
-                      Difference from Recommended:
-                      <span className={`ml-2 ${testProjection.netRevenue > recommendedProjection.netRevenue ? 'text-green-600' : 'text-red-600'}`}>
-                        {testProjection.netRevenue > recommendedProjection.netRevenue ? '↑' : '↓'}
-                        ${formatNumber(Math.abs(testProjection.netRevenue - recommendedProjection.netRevenue), 2)}k
+                      Difference from Current:
+                      <span className={`ml-2 ${testProjection.netRevenue > currentProjection.netRevenue ? 'text-green-600' : 'text-red-600'}`}>
+                        {testProjection.netRevenue > currentProjection.netRevenue ? '↑' : '↓'}
+                        ${formatNumber(Math.abs(testProjection.netRevenue - currentProjection.netRevenue), 2)}k
                       </span>
                     </p>
                   </div>
                 </div>
 
-                {/* Profit Graph with Debt Tracking */}
+                {/* Expected Cash Under Test Settings */}
                 <div className="bg-white p-6 rounded-lg border-2 border-purple-400 mt-4">
-                  <h4 className="font-bold text-lg mb-3 text-purple-800">📊 Daily Profit Projection with Debt Payments (M/M/c Queuing Model)</h4>
-                  <ResponsiveContainer width="100%" height={300}>
-                    <LineChart data={(() => {
-                      const currentDay = recommendations?.analysis.currentDay || 0;
-                      const projectionData = [];
-                      let cumulativeProfit = 0;
-                      let runningDebt = testProjection.newDebt;
-                      let runningCash = (recommendations?.analysis.cash || 0) - testProjection.totalMachineCost;
-                      const dailyInterestRate = Math.pow(1.20, 1/365) - 1; // 20% annual
-
-                      // Simulate daily variability using Poisson arrivals
-                      for (let i = 0; i < Math.min(30, testProjection.daysRemaining); i++) {
-                        const day = currentDay + i + 1;
-
-                        // Generate daily job arrivals (Poisson with λ = 10)
-                        const dailyArrivals = randomPoisson(10, day * 1000);
-
-                        // Calculate actual throughput considering capacity constraints
-                        const maxCapacity = testProjection.avgJobsPerDay * 1.2; // 20% above average
-                        const actualJobs = Math.min(dailyArrivals, maxCapacity);
-
-                        // Revenue and costs based on actual jobs completed
-                        const revenuePerJob = testProjection.expectedRevenuePerJob;
-                        const materialCostPerJob = testProjection.dailyMaterialCost / testProjection.avgJobsPerDay;
-
-                        const dailyRev = actualJobs * revenuePerJob;
-                        const dailyCost = actualJobs * materialCostPerJob;
-
-                        // Calculate daily interest on debt
-                        const dailyInterest = runningDebt > 0 ? runningDebt * dailyInterestRate : 0;
-
-                        // Calculate profit after material costs and interest
-                        const profitBeforeDebt = dailyRev - dailyCost;
-                        const netProfit = profitBeforeDebt - dailyInterest;
-
-                        // Update cash and debt (optimal paydown: use excess cash to pay debt)
-                        runningCash += netProfit;
-                        let debtPayment = 0;
-                        if (runningDebt > 0 && runningCash > 10) { // Keep $10k cash buffer
-                          debtPayment = Math.min(runningDebt, runningCash - 10);
-                          runningCash -= debtPayment;
-                          runningDebt -= debtPayment;
-                        }
-
-                        cumulativeProfit += netProfit;
-
-                        projectionData.push({
-                          day: day,
-                          revenue: parseFloat(dailyRev.toFixed(2)),
-                          materialCost: parseFloat(dailyCost.toFixed(2)),
-                          interest: parseFloat(dailyInterest.toFixed(2)),
-                          profit: parseFloat(netProfit.toFixed(2)),
-                          cumulative: parseFloat(cumulativeProfit.toFixed(2)),
-                          debt: parseFloat(runningDebt.toFixed(2)),
-                          debtPayment: parseFloat(debtPayment.toFixed(2)),
-                          cash: parseFloat(runningCash.toFixed(2))
-                        });
-                      }
-                      return projectionData;
-                    })()}>
+                  <h4 className="font-bold text-lg mb-3 text-purple-800">📊 Expected Cash Under Test Settings (Day {recommendations.analysis.currentDay + 1} → 318)</h4>
+                  <ResponsiveContainer width="100%" height={320}>
+                    <LineChart data={testProjectionData}>
                       <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="day" label={{ value: 'Day', position: 'insideBottom', offset: -5 }} />
+                      <XAxis dataKey="day" />
                       <YAxis label={{ value: 'Amount ($k)', angle: -90, position: 'insideLeft' }} />
                       <Tooltip />
                       <Legend />
+                      <Line type="monotone" dataKey="cash" stroke="#10b981" strokeWidth={3} name="Cash On Hand" />
                       <Line type="monotone" dataKey="revenue" stroke="#3b82f6" strokeWidth={2} name="Daily Revenue" />
                       <Line type="monotone" dataKey="materialCost" stroke="#ef4444" strokeWidth={2} name="Material Cost" />
-                      <Line type="monotone" dataKey="interest" stroke="#f59e0b" strokeWidth={2} name="Interest Payment" />
-                      <Line type="monotone" dataKey="profit" stroke="#10b981" strokeWidth={3} name="Net Profit (after interest)" />
+                      <Line type="monotone" dataKey="machineCost" stroke="#f59e0b" strokeWidth={2} name="Machine Payments" />
+                      <Line type="monotone" dataKey="interest" stroke="#8b5cf6" strokeWidth={2} name="Interest" />
                     </LineChart>
                   </ResponsiveContainer>
 
                   <div className="mt-4 p-3 bg-purple-50 rounded">
-                    <div className="grid grid-cols-4 gap-4 text-center">
+                    <div className="grid grid-cols-4 gap-4 text-center text-xs">
                       <div>
-                        <p className="text-xs text-gray-600">Avg Daily Revenue</p>
+                        <p className="text-gray-600">Avg Daily Revenue</p>
                         <p className="text-lg font-bold text-blue-600">${formatNumber(testProjection.dailyRevenue, 2)}k</p>
                       </div>
                       <div>
-                        <p className="text-xs text-gray-600">Avg Daily Material Cost</p>
+                        <p className="text-gray-600">Avg Daily Material Cost</p>
                         <p className="text-lg font-bold text-red-600">${formatNumber(testProjection.dailyMaterialCost, 2)}k</p>
                       </div>
                       <div>
-                        <p className="text-xs text-gray-600">Avg Daily Interest</p>
-                        <p className="text-lg font-bold text-orange-600">${formatNumber((testProjection.newDebt * (Math.pow(1.20, 1/365) - 1)), 3)}k</p>
+                        <p className="text-gray-600">Total Machine Cost</p>
+                        <p className="text-lg font-bold text-orange-600">${formatNumber(testProjection.totalMachineCost, 2)}k</p>
                       </div>
                       <div>
-                        <p className="text-xs text-gray-600">Avg Daily Net Profit</p>
-                        <p className="text-lg font-bold text-green-600">${formatNumber((testProjection.dailyProfit - (testProjection.newDebt * (Math.pow(1.20, 1/365) - 1))), 2)}k</p>
-                      </div>
-                    </div>
-
-                    <div className="mt-4 pt-4 border-t border-purple-200">
-                      <p className="text-xs text-gray-700 mb-2"><strong>M/M/c Queuing Model:</strong></p>
-                      <div className="grid grid-cols-2 gap-3 text-xs">
-                        <div>
-                          <p className="text-gray-600">Arrival Rate (λ):</p>
-                          <p className="font-bold">10 jobs/day (Poisson)</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600">Throughput:</p>
-                          <p className="font-bold">{testProjection.avgJobsPerDay.toFixed(2)} jobs/day</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600">Station 1 Capacity:</p>
-                          <p className="font-bold">{(testSettings.station1Machines * 4.0).toFixed(1)} jobs/day
-                            {Math.min(
-                              testSettings.station1Machines * 4.0,
-                              (testSettings.station2Machines * 3.5) / 2, // Station 2 used twice per job
-                              testSettings.station3Machines * 4.2
-                            ) === testSettings.station1Machines * 4.0 && ' 🔴'}
-                          </p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600">Station 2 Capacity:</p>
-                          <p className="font-bold">{((testSettings.station2Machines * 3.5) / 2).toFixed(1)} jobs/day
-                            {Math.min(
-                              testSettings.station1Machines * 4.0,
-                              (testSettings.station2Machines * 3.5) / 2,
-                              testSettings.station3Machines * 4.2
-                            ) === (testSettings.station2Machines * 3.5) / 2 && ' 🔴'}
-                          </p>
-                          <p className="text-xs text-gray-500">(÷2: each job uses Station 2 twice)</p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600">Station 3 Capacity:</p>
-                          <p className="font-bold">{(testSettings.station3Machines * 4.2).toFixed(1)} jobs/day
-                            {Math.min(
-                              testSettings.station1Machines * 4.0,
-                              (testSettings.station2Machines * 3.5) / 2,
-                              testSettings.station3Machines * 4.2
-                            ) === testSettings.station3Machines * 4.2 && ' 🔴'}
-                          </p>
-                        </div>
-                        <div className="col-span-2 mt-2 p-2 bg-yellow-50 rounded">
-                          <p className="text-gray-700 text-xs">
-                            <strong>🔴 = Bottleneck Station</strong> - Add machines here to increase throughput and revenue!
-                          </p>
-                        </div>
-                        <div>
-                          <p className="text-gray-600">System Utilization:</p>
-                          <p className="font-bold">{((testProjection.avgJobsPerDay / Math.min(
-                            testSettings.station1Machines * 4.0,
-                            (testSettings.station2Machines * 3.5) / 2,
-                            testSettings.station3Machines * 4.2
-                          )) * 100).toFixed(1)}%</p>
-                        </div>
+                        <p className="text-gray-600">Avg Daily Interest</p>
+                        <p className="text-lg font-bold text-purple-600">${formatNumber((testProjection.newDebt * (Math.pow(1.20, 1/365) - 1)), 3)}k</p>
                       </div>
                     </div>
                   </div>
@@ -1493,16 +1936,45 @@ const LittlefieldAnalysis = () => {
                       const dailyInterestRate = Math.pow(1.20, 1/365) - 1; // 20% annual
                       const avgJobs = testProjection.avgJobsPerDay;
                       const revenuePerJob = testProjection.expectedRevenuePerJob;
-                      const materialCostPerJob = testProjection.dailyMaterialCost / avgJobs;
+                      const kitsPerJob = 60;
+                      const costPerKit = 0.010; // $10 per kit = $0.010k
+                      const fixedOrderCost = 1.0; // $1,000 per order
+                      const orderQuantity = Math.max(0, testSettings.materialOrderQty);
+                      const reorderPoint = Math.max(0, testSettings.materialReorderPoint);
+                      const materialLeadTimeDays = 3;
+                      const orderCost = (orderQuantity * costPerKit) + fixedOrderCost;
+
+                      let kitsInventory = inventoryState.inventory;
+                      let orderInTransit = inventoryState.orderInTransit;
+                      let orderArrivalDay = inventoryState.orderArrivalDay;
 
                       for (let i = 0; i <= daysToProject; i++) {
                         const day = currentDay + i;
 
-                        // Daily operations (use average throughput)
-                        const dailyRev = avgJobs * revenuePerJob;
-                        const dailyCost = avgJobs * materialCostPerJob;
+                        // Daily operations (use average throughput, capped by inventory)
+                        const maxJobsFromInventory = Math.max(0, Math.floor(kitsInventory / kitsPerJob));
+                        const jobsCompleted = Math.min(avgJobs, maxJobsFromInventory);
+                        const dailyRev = jobsCompleted * revenuePerJob;
+
+                        if (orderInTransit && day >= orderArrivalDay) {
+                          kitsInventory += orderQuantity;
+                          orderInTransit = false;
+                        }
+
+                        const kitsUsed = jobsCompleted * kitsPerJob;
+                        kitsInventory -= kitsUsed;
+
+                        let materialCost = 0;
+                        if (kitsInventory <= reorderPoint &&
+                            !orderInTransit &&
+                            runningCash >= orderCost &&
+                            orderQuantity > 0) {
+                          materialCost = orderCost;
+                          orderInTransit = true;
+                          orderArrivalDay = day + materialLeadTimeDays;
+                        }
                         const dailyInterest = runningDebt > 0 ? runningDebt * dailyInterestRate : 0;
-                        const netProfit = dailyRev - dailyCost - dailyInterest;
+                        const netProfit = dailyRev - materialCost - dailyInterest;
 
                         // Update cash and debt (optimal paydown strategy)
                         runningCash += netProfit;
@@ -1554,26 +2026,22 @@ const LittlefieldAnalysis = () => {
                       const kitsPerJob = 60;
                       const costPerKit = 0.010; // $10 per kit = $0.010k
                       const fixedOrderCost = 1.0; // $1,000 per order
-                      const orderQuantity = 7200; // 7,200 kits
-                      const leadTime = 2; // Assume 2 day lead time for kit delivery
+                      const orderQuantity = Math.max(0, testSettings.materialOrderQty);
+                      const reorderPoint = Math.max(0, testSettings.materialReorderPoint);
+                      const leadTime = 3; // Materials arrive exactly 3 days after order
 
-                      // Initial inventory (estimate based on current operations)
-                      let kitsInventory = 1000; // Starting inventory estimate
+                      // Initial inventory (from historical simulation)
+                      let kitsInventory = inventoryState.inventory;
                       const avgJobs = testProjection.avgJobsPerDay;
-
-                      // Calculate reorder point: (lead time × daily consumption) + safety stock
-                      const dailyConsumption = avgJobs * kitsPerJob;
-                      const safetyStock = dailyConsumption * 1.5; // 1.5 days of safety stock
-                      const reorderPoint = (leadTime * dailyConsumption) + safetyStock;
 
                       let runningCash = (recommendations?.analysis.cash || 0) - testProjection.totalMachineCost;
                       let runningDebt = testProjection.newDebt;
                       const dailyInterestRate = Math.pow(1.20, 1/365) - 1;
                       const revenuePerJob = testProjection.expectedRevenuePerJob;
-                      const materialCostPerJob = testProjection.dailyMaterialCost / avgJobs;
+                      const orderCost = (orderQuantity * costPerKit) + fixedOrderCost;
 
-                      let orderInTransit = false;
-                      let orderArrivalDay = 0;
+                      let orderInTransit = inventoryState.orderInTransit;
+                      let orderArrivalDay = inventoryState.orderArrivalDay;
 
                       for (let i = 0; i <= daysToProject; i++) {
                         const day = currentDay + i;
@@ -1584,16 +2052,16 @@ const LittlefieldAnalysis = () => {
                           orderInTransit = false;
                         }
 
-                        // Daily consumption
-                        const jobsCompleted = avgJobs;
+                        // Daily consumption (capped by inventory)
+                        const maxJobsFromInventory = Math.max(0, Math.floor(kitsInventory / kitsPerJob));
+                        const jobsCompleted = Math.min(avgJobs, maxJobsFromInventory);
                         const kitsUsed = jobsCompleted * kitsPerJob;
                         kitsInventory -= kitsUsed;
 
                         // Daily cash flow
                         const dailyRev = jobsCompleted * revenuePerJob;
-                        const dailyCost = jobsCompleted * materialCostPerJob;
                         const dailyInterest = runningDebt > 0 ? runningDebt * dailyInterestRate : 0;
-                        const netProfit = dailyRev - dailyCost - dailyInterest;
+                        const netProfit = dailyRev - dailyInterest;
                         runningCash += netProfit;
 
                         // Optimal debt paydown
@@ -1605,8 +2073,6 @@ const LittlefieldAnalysis = () => {
 
                         // Check ordering conditions
                         let orderPlaced = 0;
-                        const orderCost = (orderQuantity * costPerKit) + fixedOrderCost;
-
                         if (kitsInventory <= reorderPoint &&
                             !orderInTransit &&
                             runningCash >= orderCost &&
@@ -1667,11 +2133,13 @@ const LittlefieldAnalysis = () => {
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
                       <div>
                         <p className="text-gray-600">Order Quantity:</p>
-                        <p className="font-bold">7,200 kits</p>
+                        <p className="font-bold">{formatNumber(testSettings.materialOrderQty, 0)} kits</p>
                       </div>
                       <div>
                         <p className="text-gray-600">Order Cost:</p>
-                        <p className="font-bold">$73k ($10/kit + $1k fixed)</p>
+                        <p className="font-bold">
+                          ${formatNumber(((testSettings.materialOrderQty * 0.010) + 1.0), 2)}k ($10/kit + $1k fixed)
+                        </p>
                       </div>
                       <div>
                         <p className="text-gray-600">Daily Usage:</p>
@@ -1679,7 +2147,7 @@ const LittlefieldAnalysis = () => {
                       </div>
                       <div>
                         <p className="text-gray-600">Lead Time:</p>
-                        <p className="font-bold">2 days</p>
+                        <p className="font-bold">3 days</p>
                       </div>
                     </div>
                     <p className="text-xs text-gray-700 mt-2">
@@ -1722,6 +2190,14 @@ const LittlefieldAnalysis = () => {
                 <div className="flex justify-between p-2 bg-gray-50 rounded">
                   <span>Station 2 Priority:</span>
                   <span className="font-bold">{currentSettings.station2Priority}</span>
+                </div>
+                <div className="flex justify-between p-2 bg-gray-50 rounded">
+                  <span>Material ROP:</span>
+                  <span className="font-bold">{formatNumber(currentSettings.materialReorderPoint, 0)} kits</span>
+                </div>
+                <div className="flex justify-between p-2 bg-gray-50 rounded">
+                  <span>Material Order Qty:</span>
+                  <span className="font-bold">{formatNumber(currentSettings.materialOrderQty, 0)} kits</span>
                 </div>
               </div>
             </div>
@@ -1770,6 +2246,20 @@ const LittlefieldAnalysis = () => {
                   <span className={`font-bold ${recommendations.station2Priority !== currentSettings.station2Priority ? 'text-green-600' : ''}`}>
                     {recommendations.station2Priority}
                     {recommendations.station2Priority !== currentSettings.station2Priority && ' ⬆️'}
+                  </span>
+                </div>
+                <div className="flex justify-between p-2 bg-white rounded">
+                  <span>Material ROP:</span>
+                  <span className={`font-bold ${recommendations.materialReorderPoint !== currentSettings.materialReorderPoint ? 'text-green-600' : ''}`}>
+                    {formatNumber(recommendations.materialReorderPoint, 0)} kits
+                    {recommendations.materialReorderPoint !== currentSettings.materialReorderPoint && ' ⬆️'}
+                  </span>
+                </div>
+                <div className="flex justify-between p-2 bg-white rounded">
+                  <span>Material Order Qty:</span>
+                  <span className={`font-bold ${recommendations.materialOrderQty !== currentSettings.materialOrderQty ? 'text-green-600' : ''}`}>
+                    {formatNumber(recommendations.materialOrderQty, 0)} kits
+                    {recommendations.materialOrderQty !== currentSettings.materialOrderQty && ' ⬆️'}
                   </span>
                 </div>
               </div>
@@ -1840,12 +2330,6 @@ const LittlefieldAnalysis = () => {
             </>
           )}
 
-          <button
-            onClick={handleReset}
-            className="w-full bg-gray-600 hover:bg-gray-700 text-white font-bold py-3 px-6 rounded-lg text-lg transition"
-          >
-            ← Back to Input
-          </button>
         </div>
       </div>
     );

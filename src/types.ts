@@ -38,6 +38,8 @@ export interface Config {
   station2Machines: number;
   station3Machines: number;
   station2Priority: string;
+  materialReorderPoint: number;
+  materialOrderQty: number;
 }
 
 export interface ParsedData {
@@ -66,6 +68,8 @@ export interface Recommendations {
   station2Machines: number;
   station3Machines: number;
   station2Priority: string;
+  materialReorderPoint: number;
+  materialOrderQty: number;
   changes: Change[];
   analysis: Analysis;
 }
