@@ -35,11 +35,25 @@ export const calculateProfitProjection = (
   // M/M/c Queuing parameters
   const avgArrivalRate = 10; // λ = 10 jobs/day average (variable with exponential inter-arrival)
 
-  // Station service rates (jobs per day per machine) - approximated from historical data
+  // Calculate service rates based on empirical processing times for the lot size
+  // Processing times from simulation data (hours per job)
+  const processingTimes: Record<number, { step1: number; step2: number; step3: number; step4: number }> = {
+    12: { step1: 2.42, step2: 0.28, step3: 0.40, step4: 0.24 }, // Step3 avg from table
+    20: { step1: 3.10, step2: 0.47, step3: 0.45, step4: 0.40 }, // Step3 avg: ~0.45
+    30: { step1: 3.95, step2: 0.71, step3: 0.95, step4: 0.60 }, // Step3 avg: ~0.95
+    60: { step1: 6.50, step2: 1.42, step3: 1.85, step4: 1.20 }  // Step3 avg: ~1.85
+  };
+
+  // Get processing times for current lot size (default to 20 if not found)
+  const lotSize = config.lotSize || 20;
+  const times = processingTimes[lotSize] || processingTimes[20];
+
+  // Convert processing times (hours) to service rates (jobs/day per machine)
+  // Station 2 average: (Step2 + Step4) / 2 since it handles both operations
   const serviceRates = {
-    station1: 4.0, // μ1 = 4 jobs/day per machine (Stuffer)
-    station2: 3.5, // μ2 = 3.5 jobs/day per machine (Tester)
-    station3: 4.2  // μ3 = 4.2 jobs/day per machine (Tuner)
+    station1: 24 / times.step1,  // Stuffer
+    station2: 24 / ((times.step2 + times.step4) / 2), // Tester (avg of Step 2 and Step 4)
+    station3: 24 / times.step3   // Tuner
   };
 
   // Calculate effective throughput considering queuing and capacity
