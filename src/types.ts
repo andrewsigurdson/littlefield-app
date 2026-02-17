@@ -5,6 +5,9 @@ export interface Change {
   cost: number;
   needsDebt?: boolean;
   priority: string;
+  recommendedDay?: number;
+  daysToWait?: number;
+  awaitingCash?: boolean;
 }
 
 export interface Bottleneck {

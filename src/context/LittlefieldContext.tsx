@@ -8,6 +8,10 @@ interface LittlefieldContextValue {
   setCsvData: (data: string) => void;
   dataFileName: string;
   setDataFileName: (name: string) => void;
+  transactionData: string;
+  setTransactionData: (data: string) => void;
+  transactionFileName: string;
+  setTransactionFileName: (name: string) => void;
   cashOnHand: string;
   setCashOnHand: (cash: string) => void;
   debt: string;
@@ -21,24 +25,28 @@ interface LittlefieldContextValue {
   testSettings: Config;
   setTestSettings: (settings: Config) => void;
   handleFileUpload: (file: File) => Promise<void>;
+  handleTransactionFileUpload: (file: File) => Promise<void>;
 }
 
 const LittlefieldContext = createContext<LittlefieldContextValue | undefined>(undefined);
 
+// Initial system defaults (before any transactions)
 const defaultSettings: Config = {
-  lotSize: 20,
+  lotSize: 60,
   contract: 1,
   station1Machines: 3,
   station2Machines: 1,
   station3Machines: 1,
   station2Priority: 'FIFO',
-  materialReorderPoint: 1320,
+  materialReorderPoint: 1200,
   materialOrderQty: 7200
 };
 
 export const LittlefieldProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [csvData, setCsvData] = useState('');
   const [dataFileName, setDataFileName] = useState('');
+  const [transactionData, setTransactionData] = useState('');
+  const [transactionFileName, setTransactionFileName] = useState('');
   const [cashOnHand, setCashOnHand] = useState('');
   const [debt, setDebt] = useState('');
   const [loading, setLoading] = useState(false);
@@ -71,11 +79,34 @@ export const LittlefieldProvider: React.FC<{ children: ReactNode }> = ({ childre
     }
   };
 
+  const handleTransactionFileUpload = async (file: File) => {
+    try {
+      setTransactionFileName(file.name);
+
+      const arrayBuffer = await file.arrayBuffer();
+      const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+
+      // Get the first sheet
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+
+      // Convert to tab-separated values (TSV)
+      const tsvData = XLSX.utils.sheet_to_csv(firstSheet, { FS: '\t' });
+
+      setTransactionData(tsvData);
+    } catch (err) {
+      // Don't set error state - transaction history is optional
+    }
+  };
+
   const value: LittlefieldContextValue = {
     csvData,
     setCsvData,
     dataFileName,
     setDataFileName,
+    transactionData,
+    setTransactionData,
+    transactionFileName,
+    setTransactionFileName,
     cashOnHand,
     setCashOnHand,
     debt,
@@ -88,7 +119,8 @@ export const LittlefieldProvider: React.FC<{ children: ReactNode }> = ({ childre
     setCurrentSettings,
     testSettings,
     setTestSettings,
-    handleFileUpload
+    handleFileUpload,
+    handleTransactionFileUpload
   };
 
   return (

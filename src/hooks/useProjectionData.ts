@@ -22,6 +22,9 @@ interface Recommendations {
 
 interface Projection {
   avgJobsPerDay: number;
+  totalMachineCost?: number;
+  upfrontFee?: number;
+  newDebt?: number;
 }
 
 interface Job {
@@ -57,8 +60,12 @@ export function useProjectionData(
     const daysRemaining = 318 - currentDay;
     const dailyDebtInterestRate = Math.pow(1.20, 1 / 365) - 1;
     const dailyCashInterestRate = Math.pow(1.10, 1 / 365) - 1;
-    let runningDebt = recommendations.analysis.debt;
-    let runningCash = recommendations.analysis.cash;
+
+    // Account for machine purchases and debt
+    const machineCost = projection.totalMachineCost || 0;
+    const upfrontFee = projection.upfrontFee || 0;
+    let runningDebt = projection.newDebt || recommendations.analysis.debt;
+    let runningCash = recommendations.analysis.cash - machineCost - upfrontFee;
 
     if (projection.avgJobsPerDay <= 0) return [];
 
@@ -74,6 +81,7 @@ export function useProjectionData(
     // Processing times per LOT (in days)
     const processingTimesByLot: Record<number, { s1: number; s2: number; s3: number; s4: number }> = {
       12: { s1: 2.42/24, s2: 0.28/24, s3: 0.40/24, s4: 0.24/24 },
+      15: { s1: 2.68/24, s2: 0.35/24, s3: 0.48/24, s4: 0.30/24 }, // Interpolated between 12 and 20
       20: { s1: 3.10/24, s2: 0.47/24, s3: 0.61/24, s4: 0.40/24 }, // Updated s3 to 0.61 (correct average)
       30: { s1: 3.95/24, s2: 0.71/24, s3: 0.95/24, s4: 0.60/24 },
       60: { s1: 6.50/24, s2: 1.42/24, s3: 1.85/24, s4: 1.20/24 }
@@ -150,34 +158,11 @@ export function useProjectionData(
       Math.round(dailyLotThroughput * pipelineBuffer * 0.4) // 40% of buffer at S4 (closer to completion)
     );
 
-    console.log('[DEBUG] Initial WIP Distribution:', {
-      projectionAvgJobsPerDay: projection.avgJobsPerDay,
-      bottleneckThroughputLotsPerDay: bottleneckThroughput.toFixed(1),
-      bottleneckThroughputJobsPerDay: (bottleneckThroughput / lotsPerJob).toFixed(1),
-      expectedDailyJobCompletions: expectedDailyJobCompletions.toFixed(1),
-      dailyLotThroughput: dailyLotThroughput.toFixed(1),
-      pipelineBufferDays: pipelineBuffer,
-      lotsPerJob,
-      lotsAtS3: lotsAtS3,
-      lotsAtS4: lotsAtS4
-    });
-
     // Calculate total WIP from actual queue data (not Little's Law)
     const totalWIPLots = lotsAtS1 + lotsAtS2 + lotsAtS3 + lotsAtS4;
 
-    console.log('[INIT] System State - Lots by Station:', {
-      'Station 1': lotsAtS1 + ' lots',
-      'Station 2 (test1+test4)': (lotsAtS2 + lotsAtS4) + ` lots (${lotsAtS2} test1, ${lotsAtS4} test4)`,
-      'Station 3': lotsAtS3 + ' lots',
-      '---': '---',
-      'Total WIP': totalWIPLots + ' lots',
-      'Estimated Jobs': Math.floor(totalWIPLots / lotsPerJob) + ' jobs',
-      'Bottleneck Throughput': bottleneckThroughput.toFixed(1) + ' lots/day'
-    });
-
     // Safety check - if WIP is unreasonably large, use Little's Law instead
     if (totalWIPLots > 300) {
-      console.warn('WIP too large, falling back to Little\'s Law');
       return [];
     }
 
@@ -320,21 +305,12 @@ export function useProjectionData(
     // Service rates (lots per hour) at each station
     const serviceRateS1PerMachine = 1 / procTimes.s1; // lots/hour per machine
     const serviceRateS1Total = serviceRateS1PerMachine * settings.station1Machines; // total lots/hour
-    const serviceRateS2 = 1 / procTimes.s2; // lots/hour (test1)
+    // const serviceRateS2 = 1 / procTimes.s2; // lots/hour (test1)
     const serviceRateS3 = 1 / procTimes.s3; // lots/hour
-    const serviceRateS4 = 1 / procTimes.s4; // lots/hour (test4)
+    // const serviceRateS4 = 1 / procTimes.s4; // lots/hour (test4)
 
     // Station 2 combined rate (for capacity constraint - same machine does both test1 and test4)
-    const serviceRateS2Combined = 1 / (procTimes.s2 + procTimes.s4); // lots/hour for full cycle
-
-    console.log('[QUEUING THEORY] Service rates (lots/hour):', {
-      S1: serviceRateS1Total.toFixed(2),
-      S2_test1: serviceRateS2.toFixed(2),
-      S3: serviceRateS3.toFixed(2),
-      S4_test4: serviceRateS4.toFixed(2),
-      S2_combined: serviceRateS2Combined.toFixed(2),
-      'Bottleneck (lots/day)': (Math.min(serviceRateS1Total, serviceRateS2Combined, serviceRateS3) * 24).toFixed(1)
-    });
+    // const serviceRateS2Combined = 1 / (procTimes.s2 + procTimes.s4); // lots/hour for full cycle
 
     // Daily simulation loop with HOURLY TIMESTEPS for continuous flow
     for (let i = 0; i < daysRemaining; i++) {
@@ -347,7 +323,7 @@ export function useProjectionData(
       }
 
       // 2. Process waiting for kits queue (at start of day)
-      const waitingBeforeProcessing = waitingForKits.length;
+      // const waitingBeforeProcessing = waitingForKits.length;
       while (waitingForKits.length > 0 && kitsInventory >= kitsPerJob) {
         const jobId = waitingForKits.shift()!;
         const job = jobs.get(jobId)!;
@@ -365,7 +341,7 @@ export function useProjectionData(
           lots.push(lot);
         }
       }
-      const jobsAcceptedFromQueue = waitingBeforeProcessing - waitingForKits.length;
+      // const jobsAcceptedFromQueue = waitingBeforeProcessing - waitingForKits.length;
 
       // 3. New arrivals (spread throughout the day using Poisson)
       const arrivals = randomPoisson(avgArrivalRate || 10, day * 137);
@@ -419,72 +395,57 @@ export function useProjectionData(
 
       // Service rates in lots/day (already calculated above as lots/hour * 24)
       const capacityS1Daily = serviceRateS1Total * 24;
-      const capacityS2Daily = serviceRateS2 * 24;
+      // const capacityS2Daily = serviceRateS2 * 24;
       const capacityS3Daily = serviceRateS3 * 24;
-      const capacityS4Daily = serviceRateS4 * 24;
+      // const capacityS4Daily = serviceRateS4 * 24;
 
       // Calculate utilization (ρ = λ/μ)
       // Arrival rate at each station = throughput from previous station
-      const arrivalRateS1 = newLotsToday.length; // lots arriving at S1 today
-      const utilizationS1 = Math.min(0.99, (lotsAtS1.length + arrivalRateS1) / capacityS1Daily);
+      // const arrivalRateS1 = newLotsToday.length; // lots arriving at S1 today
+      // const utilizationS1 = Math.min(0.99, (lotsAtS1.length + arrivalRateS1) / capacityS1Daily);
 
       // Steady-state throughput (can't exceed capacity or available lots)
-      const throughputS1 = Math.min(lotsAtS1.length, capacityS1Daily);
-      const utilizationS2 = Math.min(0.99, (lotsAtS2.length + throughputS1) / capacityS2Daily);
+      // const throughputS1 = Math.min(lotsAtS1.length, capacityS1Daily);
+      // const utilizationS2 = Math.min(0.99, (lotsAtS2.length + throughputS1) / capacityS2Daily);
 
-      const throughputS2 = Math.min(lotsAtS2.length, capacityS2Daily);
-      const utilizationS3 = Math.min(0.99, (lotsAtS3.length + throughputS2) / capacityS3Daily);
+      // const throughputS2 = Math.min(lotsAtS2.length, capacityS2Daily);
+      // const utilizationS3 = Math.min(0.99, (lotsAtS3.length + throughputS2) / capacityS3Daily);
 
-      const throughputS3 = Math.min(lotsAtS3.length, capacityS3Daily);
-      const utilizationS4 = Math.min(0.99, (lotsAtS4.length + throughputS3) / capacityS4Daily);
+      // const throughputS3 = Math.min(lotsAtS3.length, capacityS3Daily);
+      // const utilizationS4 = Math.min(0.99, (lotsAtS4.length + throughputS3) / capacityS4Daily);
 
       // Calculate avg queue time using M/M/c formulas (in days)
       // For M/M/c: W_q ≈ (ρ^√(2(c+1))) / (c×μ×(1-ρ)) - Kingman approximation
       // For M/M/1: W_q = ρ/(μ(1-ρ))
 
-      function calcMM1QueueTime(utilization: number, procTimeHours: number): number {
-        if (utilization >= 1) return 999; // Unstable
-        const mu = 24 / procTimeHours; // service rate in lots/day
-        return utilization / (mu * (1 - utilization)); // queue time in days
-      }
+      // function calcMM1QueueTime(utilization: number, procTimeHours: number): number {
+      //   if (utilization >= 1) return 999; // Unstable
+      //   const mu = 24 / procTimeHours; // service rate in lots/day
+      //   return utilization / (mu * (1 - utilization)); // queue time in days
+      // }
 
-      function calcMM3QueueTime(utilization: number, procTimeHours: number, numMachines: number): number {
-        if (utilization >= 1) return 999;
-        const mu = 24 / procTimeHours; // service rate per machine in lots/day
-        // Simplified approximation for M/M/c
-        const c = numMachines;
-        const rho = utilization;
-        // Erlang-C approximation
-        const waitTime = (Math.pow(rho, Math.sqrt(2 * (c + 1)))) / (c * mu * (1 - rho));
-        return Math.max(0, waitTime);
-      }
+      // function calcMM3QueueTime(utilization: number, procTimeHours: number, numMachines: number): number {
+      //   if (utilization >= 1) return 999;
+      //   const mu = 24 / procTimeHours; // service rate per machine in lots/day
+      //   // Simplified approximation for M/M/c
+      //   const c = numMachines;
+      //   const rho = utilization;
+      //   // Erlang-C approximation
+      //   const waitTime = (Math.pow(rho, Math.sqrt(2 * (c + 1)))) / (c * mu * (1 - rho));
+      //   return Math.max(0, waitTime);
+      // }
 
-      const queueTimeS1 = calcMM3QueueTime(utilizationS1, procTimes.s1, settings.station1Machines);
-      const queueTimeS2 = calcMM1QueueTime(utilizationS2, procTimes.s2);
-      const queueTimeS3 = calcMM1QueueTime(utilizationS3, procTimes.s3);
-      const queueTimeS4 = calcMM1QueueTime(utilizationS4, procTimes.s4);
+      // const queueTimeS1 = calcMM3QueueTime(utilizationS1, procTimes.s1, settings.station1Machines);
+      // const queueTimeS2 = calcMM1QueueTime(utilizationS2, procTimes.s2);
+      // const queueTimeS3 = calcMM1QueueTime(utilizationS3, procTimes.s3);
+      // const queueTimeS4 = calcMM1QueueTime(utilizationS4, procTimes.s4);
 
       // Total time through system (in days)
-      const totalTimeS1 = queueTimeS1 + (procTimes.s1 / 24);
-      const totalTimeS2 = queueTimeS2 + (procTimes.s2 / 24);
-      const totalTimeS3 = queueTimeS3 + (procTimes.s3 / 24);
-      const totalTimeS4 = queueTimeS4 + (procTimes.s4 / 24);
-      const totalSystemTime = totalTimeS1 + totalTimeS2 + totalTimeS3 + totalTimeS4;
-
-      if (day === currentDay + 1) {
-        console.log(`[DAY ${day}] QUEUING THEORY Analysis:`, {
-          utilizationS1: utilizationS1.toFixed(3),
-          utilizationS2: utilizationS2.toFixed(3),
-          utilizationS3: utilizationS3.toFixed(3),
-          utilizationS4: utilizationS4.toFixed(3),
-          queueTimeS1_hours: (queueTimeS1 * 24).toFixed(2),
-          queueTimeS2_hours: (queueTimeS2 * 24).toFixed(2),
-          queueTimeS3_hours: (queueTimeS3 * 24).toFixed(2),
-          queueTimeS4_hours: (queueTimeS4 * 24).toFixed(2),
-          totalSystemTime_hours: (totalSystemTime * 24).toFixed(2),
-          'Lots can complete same-day?': totalSystemTime < 1 ? 'YES' : 'NO'
-        });
-      }
+      // const totalTimeS1 = queueTimeS1 + (procTimes.s1 / 24);
+      // const totalTimeS2 = queueTimeS2 + (procTimes.s2 / 24);
+      // const totalTimeS3 = queueTimeS3 + (procTimes.s3 / 24);
+      // const totalTimeS4 = queueTimeS4 + (procTimes.s4 / 24);
+      // const totalSystemTime = totalTimeS1 + totalTimeS2 + totalTimeS3 + totalTimeS4;
 
       // FLOW MODEL: Lots flow through system at steady-state rates
       // Since total system time < 1 day, lots can move through multiple stations per day
@@ -553,30 +514,6 @@ export function useProjectionData(
       lots.push(...newLotsToday);
 
       // Log END of day state for days 73-75
-      if (day >= currentDay + 1 && day <= currentDay + 3) {
-        const endLotsAtS1 = lots.filter(l => l.currentStation === 1).length;
-        const endLotsAtS2 = lots.filter(l => l.currentStation === 2).length;
-        const endLotsAtS3 = lots.filter(l => l.currentStation === 3).length;
-        const endLotsAtS4 = lots.filter(l => l.currentStation === 4).length;
-        const endCompleted = lots.filter(l => l.currentStation === 'complete').length;
-
-        console.log(`[DAY ${day}] END - Lots processed:`, {
-          S1: lotsS1ToProcess + ' lots → S2',
-          S2: lotsS2ToProcess + ' lots → S3',
-          S3: lotsS3ToProcess + ' lots → S4',
-          S4: lotsS4ToProcess + ' lots → Complete',
-        });
-
-        console.log(`[DAY ${day}] END - Station state:`, {
-          S1: endLotsAtS1,
-          S2: endLotsAtS2,
-          S3: endLotsAtS3,
-          S4: endLotsAtS4,
-          Completed: endCompleted,
-          totalInSystem: endLotsAtS1 + endLotsAtS2 + endLotsAtS3 + endLotsAtS4
-        });
-      }
-
       // 5. Check job completions (job completes when all its lots are complete)
       const completedJobs: Job[] = [];
       let totalLeadTime = 0;
@@ -587,18 +524,6 @@ export function useProjectionData(
           completedJobs.push(job);
           totalLeadTime += day - job.startDay;
         }
-      }
-
-      if (day === currentDay + 1) {
-        console.log(`[DAY ${day}] Summary:`, {
-          arrivals,
-          jobsAccepted: newJobsAccepted + jobsAcceptedFromQueue,
-          jobsCompleted: completedJobs.length,
-          jobsWaitingForKits: waitingForKits.length,
-          kitsInventory,
-          orderInTransit,
-          orderArrivalDay
-        });
       }
 
       const avgCompletedLeadTime = completedJobs.length > 0 ? totalLeadTime / completedJobs.length : 0;
@@ -682,8 +607,11 @@ export function useProjectionData(
         day,
         revenue: parseFloat(dailyRev.toFixed(2)),
         materialCost: parseFloat(materialCost.toFixed(2)),
-        machineCost: 0,
+        machineCost: i === 0 ? machineCost : 0, // Apply machine cost only on first day
         interest: parseFloat(netInterest.toFixed(3)),
+        debtInterest: parseFloat(debtInterestPaid.toFixed(3)),
+        cashInterest: parseFloat(cashInterestEarned.toFixed(3)),
+        debtPayment: parseFloat(debtPayment.toFixed(2)),
         profit: parseFloat(netProfit.toFixed(2)),
         debt: parseFloat(runningDebt.toFixed(2)),
         cash: parseFloat(runningCash.toFixed(2)),
